@@ -23,6 +23,17 @@ object UrlLineParser {
     )
 
     fun parse(line: String, allowedDomains: Set<String>): ParsedLine {
+        return parse(
+            line,
+            DomainPolicy(
+                enabled = allowedDomains.isNotEmpty(),
+                domains = allowedDomains,
+                openUnlisted = false,
+            ),
+        )
+    }
+
+    fun parse(line: String, policy: DomainPolicy): ParsedLine {
         if (!line.startsWith(PREFIX)) return ParsedLine.Ignored
         val rawUrl = line.removePrefix(PREFIX).trim()
         if (rawUrl.isEmpty() || rawUrl.length > MAX_URL_LENGTH) {
@@ -43,8 +54,8 @@ object UrlLineParser {
             return ParsedLine.Malformed(rawUrl)
         }
         val host = asciiHost(uri.host) ?: return ParsedLine.Malformed(rawUrl)
-        if (!isHostAllowed(host, allowedDomains)) {
-            return ParsedLine.RejectedDomain(rawUrl, host)
+        if (policy.enabled && !matchesDomain(host, policy.domains)) {
+            if (!policy.openUnlisted) return ParsedLine.RejectedDomain(rawUrl, host)
         }
         return ParsedLine.Valid(rawUrl)
     }
@@ -67,6 +78,11 @@ object UrlLineParser {
 
     fun isHostAllowed(host: String, allowed: Set<String>): Boolean {
         if (allowed.isEmpty()) return true
+        val normalized = asciiHost(host) ?: return false
+        return matchesDomain(normalized, allowed)
+    }
+
+    private fun matchesDomain(host: String, allowed: Set<String>): Boolean {
         val normalized = asciiHost(host) ?: return false
         return allowed.any { domain ->
             normalized == domain || normalized.endsWith(".$domain")

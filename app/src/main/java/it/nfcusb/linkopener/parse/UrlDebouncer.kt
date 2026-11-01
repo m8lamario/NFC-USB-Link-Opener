@@ -5,10 +5,15 @@ package it.nfcusb.linkopener.parse
  * Un duplicato ignorato non sposta la finestra.
  */
 class UrlDebouncer(
-    private val windowMs: Long = WINDOW_MS,
+    windowMs: Long = WINDOW_MS,
     private val now: () -> Long = System::currentTimeMillis,
 ) {
+    var windowMs: Long = windowMs
     private val lastAccepted = HashMap<String, Long>()
+
+    fun clear() {
+        lastAccepted.clear()
+    }
 
     fun shouldOpen(url: String): Boolean {
         val time = now()

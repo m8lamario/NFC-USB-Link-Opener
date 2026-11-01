@@ -5,4 +5,5 @@ enum class ReaderPhase {
     WaitingPermission,
     Active,
     Unplugged,
+    ReadError,
 }
