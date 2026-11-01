@@ -44,17 +44,30 @@ I test di parser, debounce e buffer di riga:
 ./gradlew test
 ```
 
+## Collegamento automatico
+
+Con l’interruttore **Avvia quando colleghi il reader** acceso (è il valore predefinito), inserire l’ESP32 o il convertitore USB fa due cose:
+
+1. Android apre **NFC USB Link Opener**, perché l’app è registrata per `USB_DEVICE_ATTACHED`. Se il telefono chiede con quale app aprire il dispositivo, scegli questa e, se compare, **Sempre** / usa come predefinita.
+2. L’app avvia il reader da sola e chiede il permesso USB, se non è già stato concesso.
+
+La prima volta restano due tocchi di sistema, non dell’app: il dialogo USB e, su Android 13+, il permesso notifiche. Dopo, un nuovo collegamento riapre l’app e il reader senza premere **Avvia reader**.
+
+**Ferma reader** chiude la sessione corrente. Il reader non riparte finché non scolleghi e ricolleghi il dispositivo, oppure finché non premi di nuovo **Avvia reader**. Se spegni l’interruttore, il collegamento USB apre ancora l’app ma non avvia il reader.
+
+Alcuni telefoni, con l’app chiusa del tutto, non rilanciano l’activity finché non è stata scelta almeno una volta come app per quel dispositivo. Non è possibile aggirare il permesso USB né forzare l’apertura del browser dal background: in quel caso resta la notifica **Link NFC rilevato**.
+
 ## Autorizzazione OTG
 
-1. Collega l’ESP32 al telefono con l’adattatore OTG. Se il telefono chiede quale app aprire, scegli **NFC USB Link Opener**.
-2. Nell’app premi **Avvia reader**.
+1. Collega l’ESP32 al telefono con l’adattatore OTG.
+2. Se l’app non si apre da sola, aprila e controlla che **Avvia quando colleghi il reader** sia attivo, poi ricollega il cavo oppure premi **Avvia reader**.
 3. Accetta il dialogo di sistema del permesso USB. Lo stato diventa **Reader attivo** e compare la notifica persistente **Reader NFC USB attivo**.
 4. Su Android 13+ accetta anche le notifiche: servono per il reader in background e per il pulsante **Apri link**.
 5. Avvicina un tag. Il firmware invia `URL:https://...` e, se l’app è in primo piano e l’apertura automatica è attiva, si apre il browser.
 
 Per fermare: **Ferma reader** nella schermata o nella notifica. La porta seriale, la coroutine di lettura e il servizio vengono chiusi.
 
-Se scolleghi il cavo lo stato diventa **Reader disconnesso**. Ricollegando, con il reader ancora avviato, l’app chiede di nuovo il permesso se serve e riapre la porta. Dopo un kill del processo il servizio non riparte da solo (`START_NOT_STICKY`): riapri l’app oppure ricollega il dispositivo se il reader era rimasto armato.
+Se scolleghi il cavo lo stato diventa **Reader disconnesso**. Ricollegando, l’app si riapre e, con l’avvio automatico attivo, richiede di nuovo il permesso se serve e riapre la porta.
 
 ## Schermata
 
@@ -62,6 +75,7 @@ Se scolleghi il cavo lo stato diventa **Reader disconnesso**. Ricollegando, con 
 - Avvio e arresto. Con più seriali USB si sceglie il dispositivo.
 - Baud rate modificabile.
 - **Apri automaticamente i link**. Se è spento, l’URL viene solo registrato.
+- **Avvia quando colleghi il reader**. Se è acceso, inserire il dispositivo apre l’app e avvia il reader.
 - **Domini consentiti**, uno per riga. Vuoto = tutti gli `http`/`https` validi. `esempio.it` include anche i sottodomini, per esempio `tag.esempio.it`. `*.esempio.it` è accettato. Le righe che non sono nomi host vengono ignorate.
 - Ultime righe ricevute, con **Copia log** e **Condividi log**.
 
@@ -76,7 +90,7 @@ Se scolleghi il cavo lo stato diventa **Reader disconnesso**. Ricollegando, con 
 
 ## App in background
 
-Il servizio in primo piano parte solo da **Avvia reader**, dopo il consenso USB. La notifica persistente mostra lo stato e **Ferma reader**.
+Il servizio in primo piano parte da **Avvia reader** oppure dal collegamento USB, quando l’app viene portata in primo piano, e solo dopo il consenso USB. La notifica persistente mostra lo stato e **Ferma reader**.
 
 Se l’app è visibile, il link si apre subito. Se non è visibile, Android può bloccare l’apertura di un’activity: l’app tenta comunque l’apertura e, in ogni caso, mostra la notifica ad alta priorità **Link NFC rilevato** con **Apri link**. Quel tocco è il gesto che il sistema accetta. Non vengono usati overlay né servizi di accessibilità.
 

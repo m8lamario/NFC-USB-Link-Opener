@@ -13,6 +13,8 @@
     <string name="hint_baud">Predefinito 115200. Vale dalla prossima connessione.</string>
     <string name="error_baud">Baud rate non valido</string>
     <string name="label_auto_open">Apri automaticamente i link</string>
+    <string name="label_start_on_attach">Avvia quando colleghi il reader</string>
+    <string name="log_auto_started">Reader avviato al collegamento USB</string>
     <string name="label_domains">Domini consentiti</string>
     <string name="hint_domains">Un dominio per riga. Vuoto = tutti i domini http e https. Esempio: esempio.it</string>
     <string name="invalid_domain_lines">Alcune righe non sono nomi host validi e verranno ignorate</string>

@@ -34,6 +34,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -63,21 +64,33 @@ fun ReaderScreen(viewModel: ReaderViewModel) {
     val copiedMessage = stringResource(R.string.copied)
     val emptyLogMessage = stringResource(R.string.nothing_to_copy)
     val shareTitle = stringResource(R.string.share_title)
+    var askedNotifications by remember { mutableStateOf(false) }
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         if (!granted) viewModel.onNotificationsDenied()
-        viewModel.start()
+        if (!viewModel.state.value.armed) viewModel.start()
+    }
+
+    fun needsNotificationPermission(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
     }
 
     fun startReader() {
-        val needsNotificationPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        if (needsNotificationPermission) {
+        if (needsNotificationPermission() && !askedNotifications) {
+            askedNotifications = true
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else {
             viewModel.start()
+        }
+    }
+
+    LaunchedEffect(state.phase) {
+        if (state.armed && state.phase == ReaderPhase.Active && needsNotificationPermission() && !askedNotifications) {
+            askedNotifications = true
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
@@ -139,6 +152,20 @@ fun ReaderScreen(viewModel: ReaderViewModel) {
                 Switch(
                     checked = state.autoOpen,
                     onCheckedChange = viewModel::onAutoOpenChange,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = stringResource(R.string.label_start_on_attach),
+                    modifier = Modifier.weight(1f).padding(end = 12.dp),
+                )
+                Switch(
+                    checked = state.startOnAttach,
+                    onCheckedChange = viewModel::onStartOnAttachChange,
                 )
             }
             OutlinedTextField(

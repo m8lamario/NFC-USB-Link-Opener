@@ -13,6 +13,7 @@ class ReaderPreferences(context: Context) {
         return ReaderSettings(
             baudRate = baud,
             autoOpen = prefs.getBoolean(KEY_AUTO, true),
+            startOnAttach = prefs.getBoolean(KEY_START_ON_ATTACH, true),
             allowedDomainsText = prefs.getString(KEY_DOMAINS, "").orEmpty(),
             selectedDeviceKey = prefs.getString(KEY_DEVICE, null),
             armed = prefs.getBoolean(KEY_ARMED, false),
@@ -23,6 +24,7 @@ class ReaderPreferences(context: Context) {
         prefs.edit()
             .putInt(KEY_BAUD, settings.baudRate)
             .putBoolean(KEY_AUTO, settings.autoOpen)
+            .putBoolean(KEY_START_ON_ATTACH, settings.startOnAttach)
             .putString(KEY_DOMAINS, settings.allowedDomainsText)
             .putString(KEY_DEVICE, settings.selectedDeviceKey)
             .putBoolean(KEY_ARMED, settings.armed)
@@ -33,6 +35,7 @@ class ReaderPreferences(context: Context) {
         const val NAME = "reader"
         const val KEY_BAUD = "baud"
         const val KEY_AUTO = "auto_open"
+        const val KEY_START_ON_ATTACH = "start_on_attach"
         const val KEY_DOMAINS = "domains"
         const val KEY_DEVICE = "device"
         const val KEY_ARMED = "armed"

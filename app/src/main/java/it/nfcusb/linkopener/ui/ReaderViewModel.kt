@@ -27,6 +27,7 @@ data class ReaderUiState(
     val baudRateText: String,
     val baudInvalid: Boolean,
     val autoOpen: Boolean,
+    val startOnAttach: Boolean,
     val allowedDomainsText: String,
     val domainsInvalid: Boolean,
     val logText: String,
@@ -54,6 +55,7 @@ class ReaderViewModel(
             baudRateText = baud,
             baudInvalid = BaudRates.parse(baud) == null,
             autoOpen = snapshot.settings.autoOpen,
+            startOnAttach = snapshot.settings.startOnAttach,
             allowedDomainsText = domains,
             domainsInvalid = UrlLineParser.invalidDomainLines(domains).isNotEmpty(),
             logText = formatLog(snapshot.log),
@@ -76,6 +78,8 @@ class ReaderViewModel(
 
     fun onAutoOpenChange(enabled: Boolean) = runtime.updateAutoOpen(enabled)
 
+    fun onStartOnAttachChange(enabled: Boolean) = runtime.updateStartOnAttach(enabled)
+
     fun onDomainsChange(text: String) {
         domainsDraft.value = text
         runtime.updateDomains(text)
@@ -97,6 +101,7 @@ class ReaderViewModel(
             baudRateText = baudDraft.value,
             baudInvalid = BaudRates.parse(baudDraft.value) == null,
             autoOpen = snapshot.settings.autoOpen,
+            startOnAttach = snapshot.settings.startOnAttach,
             allowedDomainsText = domainsDraft.value,
             domainsInvalid = UrlLineParser.invalidDomainLines(domainsDraft.value).isNotEmpty(),
             logText = formatLog(snapshot.log),

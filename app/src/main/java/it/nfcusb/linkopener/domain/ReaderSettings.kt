@@ -3,6 +3,7 @@ package it.nfcusb.linkopener.domain
 data class ReaderSettings(
     val baudRate: Int = BaudRates.DEFAULT,
     val autoOpen: Boolean = true,
+    val startOnAttach: Boolean = true,
     val allowedDomainsText: String = "",
     val selectedDeviceKey: String? = null,
     val armed: Boolean = false,

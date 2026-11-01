@@ -25,7 +25,9 @@ import it.nfcusb.linkopener.usb.UsbSerialSession
 import it.nfcusb.linkopener.usb.usbDevice
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -101,6 +103,8 @@ class ReaderRuntime(private val app: Application) {
     private var everActive = false
     private var pendingServiceStart = false
     private var suppressAutoPermission = false
+    private var attachGeneration = 0
+    private var attachRetryJob: Job? = null
 
     private val permissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -184,11 +188,23 @@ class ReaderRuntime(private val app: Application) {
     }
 
     fun onUsbAttach() {
-        refreshDevices()
+        val generation = ++attachGeneration
+        attachRetryJob?.cancel()
         suppressAutoPermission = false
-        if (settingsState.value.armed) {
-            connectSelected(logIfMissing = false)
+        if (activateAttachedReader()) return
+        if (!settingsState.value.startOnAttach) return
+        // L'activity USB può arrivare prima che il dispositivo sia enumerato.
+        attachRetryJob = scope.launch {
+            repeat(ATTACH_RETRIES) {
+                delay(ATTACH_RETRY_MS)
+                if (generation != attachGeneration) return@launch
+                if (activateAttachedReader()) return@launch
+            }
         }
+    }
+
+    fun updateStartOnAttach(enabled: Boolean) {
+        updateSettings { it.copy(startOnAttach = enabled) }
     }
 
     fun arm() {
@@ -200,6 +216,8 @@ class ReaderRuntime(private val app: Application) {
 
     fun disarm() {
         val wasArmed = settingsState.value.armed
+        attachGeneration++
+        attachRetryJob?.cancel()
         acceptPort = false
         pendingServiceStart = false
         suppressAutoPermission = false
@@ -277,6 +295,19 @@ class ReaderRuntime(private val app: Application) {
         phaseState.value = if (everActive) ReaderPhase.Unplugged else ReaderPhase.NotConnected
         errorState.value = app.getString(R.string.log_fgs_failed)
         addLog(app.getString(R.string.log_fgs_failed))
+    }
+
+    private fun activateAttachedReader(): Boolean {
+        refreshDevices()
+        if (devicesState.value.isEmpty()) return false
+        if (!settingsState.value.armed) {
+            if (!settingsState.value.startOnAttach) return false
+            updateSettings { it.copy(armed = true) }
+            errorState.value = null
+            addLog(app.getString(R.string.log_auto_started))
+        }
+        connectSelected(logIfMissing = false)
+        return true
     }
 
     private fun connectSelected(logIfMissing: Boolean) {
@@ -478,6 +509,8 @@ class ReaderRuntime(private val app: Application) {
 
     companion object {
         const val ACTION_USB_PERMISSION = "it.nfcusb.linkopener.USB_PERMISSION"
+        private const val ATTACH_RETRIES = 5
+        private const val ATTACH_RETRY_MS = 300L
         private const val MAX_LOG_LINES = 50
         private const val MAX_LOG_TEXT = 180
     }
