@@ -1,101 +1,80 @@
-# NFC USB Link Opener
+# NFC USB Operator
 
-App Android nativa che si comporta come un lettore NFC esterno. Un ESP32-S3 collegato in USB-OTG invia righe seriali:
+App Android per leggere in sequenza tag NFC tramite un ESP32-S3 collegato in USB-OTG. Il firmware invia una riga per tag:
 
 ```text
 URL:https://esempio.it/tags/P04a
 ```
 
-Quando la riga è valida, l’app apre il link nel browser predefinito con `Intent.ACTION_VIEW`, come se il telefono avesse letto un tag NFC. Il firmware non va modificato: l’app si limita a leggere e reagire.
-
-## Requisiti
-
-- Android 8.0 (API 26) o successivo, con USB Host / OTG.
-- Android Studio recente (AGP 8.13 è supportato dalle versioni correnti).
-- JDK 17.
-- Cavo USB-OTG e un dispositivo seriale compatibile: CDC/ACM (anche ESP32-S3 in modalità USB CDC), FTDI, CP210x, CH340 o Prolific.
-- Velocità predefinita: **115200** baud, 8N1. Si cambia dalla schermata e vale dalla connessione successiva.
-
-L’USB Serial/JTAG nativo di alcuni firmware ESP32-S3 **non** è CDC/ACM. In quel caso la porta non compare tra i dispositivi seriali: serve un firmware che esponga CDC/ACM, oppure un convertitore USB-UART. Questa app non cambia il firmware.
-
-Non servono permessi NFC né servizi cloud.
+L’app apre il link nel browser, mostra il codice (`P04a`) in grande e resta pronta per la lettura successiva. Non usa server, account o cloud. Il firmware non va modificato.
 
 ## Aprire il progetto in Android Studio
 
-1. Android Studio → **File → Open** e seleziona questa cartella.
-2. Attendi il sync di Gradle. Se manca un SDK, installa **Android SDK Platform 36** e **Build-Tools 35**.
-3. Collega il telefono con il debug USB attivo, oppure usa un emulatore per la sola modalità simulata.
-4. Premi **Run**.
+1. **File → Open** e seleziona questa cartella.
+2. Attendi il sync di Gradle. Servono **Android SDK Platform 36** e **Build-Tools 35**.
+3. Imposta il JDK di Gradle su **17 o 21** (Settings → Build Tools → Gradle → Gradle JDK). Il JDK 25 di Android Studio non è compatibile con Gradle 8.13.
+4. Collega il telefono con il debug USB attivo e premi **Run**.
 
-## Compilare e installare l’APK
+## Compilare l’APK debug
 
-Da Android Studio: **Build → Build Bundle(s) / APK(s) → Build APK(s)**. L’APK di debug è in `app/build/outputs/apk/debug/`.
+Da Android Studio: **Build → Build Bundle(s) / APK(s) → Build APK(s)**.
 
-Da terminale, con `ANDROID_HOME` configurato:
+Da terminale, con `JAVA_HOME` su JDK 17 o 21 e l’SDK Android configurato:
 
 ```bash
 ./gradlew assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
-
-I test di parser, debounce e buffer di riga:
-
-```bash
 ./gradlew test
 ```
 
-## Autorizzazione OTG
+L’APK è in `app/build/outputs/apk/debug/`. Installazione:
 
-1. Collega l’ESP32 al telefono con l’adattatore OTG. Se il telefono chiede quale app aprire, scegli **NFC USB Link Opener**.
-2. Nell’app premi **Avvia reader**.
-3. Accetta il dialogo di sistema del permesso USB. Lo stato diventa **Reader attivo** e compare la notifica persistente **Reader NFC USB attivo**.
-4. Su Android 13+ accetta anche le notifiche: servono per il reader in background e per il pulsante **Apri link**.
-5. Avvicina un tag. Il firmware invia `URL:https://...` e, se l’app è in primo piano e l’apertura automatica è attiva, si apre il browser.
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
-Per fermare: **Ferma reader** nella schermata o nella notifica. La porta seriale, la coroutine di lettura e il servizio vengono chiusi.
+## Collegare l’ESP32 e autorizzare il reader
 
-Se scolleghi il cavo lo stato diventa **Reader disconnesso**. Ricollegando, con il reader ancora avviato, l’app chiede di nuovo il permesso se serve e riapre la porta. Dopo un kill del processo il servizio non riparte da solo (`START_NOT_STICKY`): riapri l’app oppure ricollega il dispositivo se il reader era rimasto armato.
+1. Collega l’ESP32 al telefono con un adattatore USB-OTG. La porta deve essere CDC/ACM, oppure FTDI, CP210x, CH340 o Prolific, a **115200** baud, 8N1.
+2. Se Android chiede con quale app aprire il dispositivo, scegli **NFC USB Operator** e, se compare, **Sempre**.
+3. L’app si apre da sola se **Avvia quando colleghi il reader** è attivo (è il valore predefinito, in Impostazioni). Altrimenti premi **Avvia reader**.
+4. Accetta il dialogo di sistema del permesso USB. Compare la notifica **Reader NFC USB attivo**.
+5. Su Android 13+ accetta le notifiche: servono per il pulsante **Apri link** quando l’app non è in primo piano.
+6. Avvicina i tag. Una riga `URL:https://...` valida apre il link, vibra e colora di verde il codice.
 
-## Schermata
+L’USB Serial/JTAG nativo di alcuni firmware ESP32-S3 non è CDC/ACM e non compare tra i dispositivi seriali.
 
-- Stato: **Reader non collegato**, **In attesa autorizzazione USB**, **Reader attivo**, **Reader disconnesso**.
-- Avvio e arresto. Con più seriali USB si sceglie il dispositivo.
-- Baud rate modificabile.
-- **Apri automaticamente i link**. Se è spento, l’URL viene solo registrato.
-- **Domini consentiti**, uno per riga. Vuoto = tutti gli `http`/`https` validi. `esempio.it` include anche i sottodomini, per esempio `tag.esempio.it`. `*.esempio.it` è accettato. Le righe che non sono nomi host vengono ignorate.
-- Ultime righe ricevute, con **Copia log** e **Condividi log**.
+**Ferma reader** è nella notifica e in Impostazioni. Scollegare il cavo mostra **Reader disconnesso**; ricollegandolo, con l’avvio automatico attivo, la porta si riapre.
 
-## Regole sulle righe
+## Schermata operatore
 
-- È valida solo una riga che inizia esattamente con `URL:`.
-- L’URL si legge senza spazi iniziali e finali e deve iniziare con `http://` o `https://` e avere un host.
-- URL malformati e domini fuori elenco si registrano e non si aprono.
-- Le altre righe (debug dell’ESP32) si ignorano e compaiono nel log come diagnosi.
-- Lo stesso URL non si apre due volte entro **1500 ms**. Il log indica `Lettura duplicata ignorata`. Un duplicato ignorato non allunga la finestra: passato il tempo, la lettura è di nuovo valida.
-- I byte si accumulano finché arriva `\n` (va bene anche `\r\n`), così una riga spezzata in più letture USB resta integra.
+- Stato grande: **Reader pronto**, **Collega il reader USB**, **In attesa del tag**, **Reader disconnesso**, **Errore di lettura**.
+- Ultimo codice, ora ed esito: verde se il link è valido e aperto, blu se il duplicato immediato è ignorato, rosso se l’URL, il codice o il dominio non è accettato.
+- Contatori di sessione: validi, duplicati, errori. Si azzerano a ogni nuovo avvio del reader.
+- **Ultime letture** e l’icona impostazioni. Baud, domini, log e dispositivi non sono sulla schermata principale.
 
-## App in background
+Il codice è l’ultimo segmento dell’URL. Il formato predefinito è un gruppo di lettere, una o più cifre e una lettera finale: `P04a`, `P7B`, `C02b`. Lo stesso URL non si apre due volte entro 1500 ms; un duplicato ignorato non allunga la finestra.
 
-Il servizio in primo piano parte solo da **Avvia reader**, dopo il consenso USB. La notifica persistente mostra lo stato e **Ferma reader**.
+## Impostazioni
 
-Se l’app è visibile, il link si apre subito. Se non è visibile, Android può bloccare l’apertura di un’activity: l’app tenta comunque l’apertura e, in ogni caso, mostra la notifica ad alta priorità **Link NFC rilevato** con **Apri link**. Quel tocco è il gesto che il sistema accetta. Non vengono usati overlay né servizi di accessibilità.
+- **Reader USB**: dispositivo, baud, riconnetti, stato tecnico, ferma reader.
+- **Sicurezza URL**: whitelist, elenco domini (esempio `esempio.it`, inclusi i sottodomini), scelta se aprire o rifiutare i domini fuori elenco, formato del codice.
+- **Comportamento**: apertura automatica, avvio al collegamento, debounce, vibrazione, suono, browser esterno o WebView interna, cancella cronologia, esporta CSV.
+- **Diagnostica**: log seriale, copia, condividi e modalità simulazione.
 
-## Prova senza ESP32
+La cronologia è in Room. Le impostazioni sono in DataStore, sul telefono.
 
-Premi **Simula lettura**. Vengono elaborate, in ordine:
+## Modalità simulata
 
-1. `URL:https://esempio.it/tags/P04a` — link valido, apre il browser se l’apertura automatica è attiva;
-2. la stessa riga — duplicato immediato, ignorato;
-3. `URL:non-e-un-url` — URL non valido;
-4. `DEBUG: lettura tag senza URL` — riga ignorata.
+Impostazioni → **Diagnostica**:
 
-Per vedere il duplicato diventare valido, aspetta almeno 1,5 secondi e premi di nuovo **Simula lettura**.
+- **Lettura valida**: `URL:https://esempio.it/tags/P04a`
+- **Duplicato immediato**: la stessa riga due volte
+- **URL non valido**
+- **Dominio non autorizzato**
+- **Simula scollegamento**
 
-## Passi che restano sul telefono
+Poi torna alla schermata operatore per vedere colore, codice e contatori. La cronologia conserva l’evento.
 
-La build e i test unitari non sostituiscono la prova hardware:
+## Link con l’app in background
 
-- collegare l’adattatore OTG e accettare il dialogo USB di Android;
-- accettare le notifiche su Android 13+;
-- verificare che l’ESP32 esponga CDC/ACM (o un chip USB-UART supportato) a 115200 baud;
-- controllare che, con l’app in background, il link arrivi come notifica **Link NFC rilevato** se il sistema blocca l’apertura diretta.
+Il servizio in primo piano resta in ascolto. Se Android blocca l’apertura diretta, arriva la notifica **Link NFC rilevato** con **Apri link**. Non si usano overlay né accessibilità.

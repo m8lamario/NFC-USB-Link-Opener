@@ -6,7 +6,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
-import it.nfcusb.linkopener.parse.ParsedLine
+import it.nfcusb.linkopener.parse.CheckResult
+import it.nfcusb.linkopener.parse.DomainPolicy
+import it.nfcusb.linkopener.parse.ReadingCheck
 import it.nfcusb.linkopener.parse.UrlLineParser
 
 /**
@@ -15,20 +17,30 @@ import it.nfcusb.linkopener.parse.UrlLineParser
 class OpenLinkActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val runtime = (application as NfcUsbLinkApp).runtime
+        val settings = runtime.settings.value
         val url = intent.getStringExtra(EXTRA_URL).orEmpty()
-        val domains = UrlLineParser.normalizeDomains(
-            (application as NfcUsbLinkApp).runtime.settings.value.allowedDomainsText,
+        val policy = DomainPolicy(
+            enabled = settings.whitelistEnabled,
+            domains = UrlLineParser.normalizeDomains(settings.allowedDomainsText),
+            openUnlisted = settings.openUnlisted,
         )
-        when (val parsed = UrlLineParser.parse("URL:$url", domains)) {
-            is ParsedLine.Valid -> openBrowser(parsed.url)
-            else -> Toast.makeText(this, R.string.error_link_blocked, Toast.LENGTH_LONG).show()
+        when (val check = ReadingCheck.check(url, policy, settings.codePattern)) {
+            is CheckResult.Accepted -> open(check.url, settings.internalBrowser)
+            is CheckResult.Rejected -> Toast.makeText(this, R.string.error_link_blocked, Toast.LENGTH_LONG).show()
         }
         finish()
     }
 
-    private fun openBrowser(url: String) {
+    private fun open(url: String, internalBrowser: Boolean) {
         try {
-            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            if (internalBrowser) {
+                startActivity(
+                    Intent(this, WebLinkActivity::class.java).putExtra(WebLinkActivity.EXTRA_URL, url),
+                )
+            } else {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            }
         } catch (_: ActivityNotFoundException) {
             Toast.makeText(this, R.string.error_no_browser, Toast.LENGTH_LONG).show()
         }

@@ -11,12 +11,23 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import androidx.core.content.ContextCompat
 import it.nfcusb.linkopener.R
+import it.nfcusb.linkopener.data.HistoryRepository
+import it.nfcusb.linkopener.data.SettingsRepository
+import it.nfcusb.linkopener.domain.LastReading
 import it.nfcusb.linkopener.domain.LogEntry
+import it.nfcusb.linkopener.domain.OperatorStatus
 import it.nfcusb.linkopener.domain.ReaderPhase
 import it.nfcusb.linkopener.domain.ReaderSettings
+import it.nfcusb.linkopener.domain.ScanOutcome
 import it.nfcusb.linkopener.domain.SerialDeviceChoice
+import it.nfcusb.linkopener.domain.SessionCounters
+import it.nfcusb.linkopener.domain.VisualOutcome
+import it.nfcusb.linkopener.parse.CheckResult
+import it.nfcusb.linkopener.parse.DomainPolicy
 import it.nfcusb.linkopener.parse.ParsedLine
+import it.nfcusb.linkopener.parse.ReadingCheck
 import it.nfcusb.linkopener.parse.SampleLines
+import it.nfcusb.linkopener.parse.TagCodeExtractor
 import it.nfcusb.linkopener.parse.UrlDebouncer
 import it.nfcusb.linkopener.parse.UrlLineParser
 import it.nfcusb.linkopener.service.ReaderForegroundService
@@ -25,13 +36,16 @@ import it.nfcusb.linkopener.usb.UsbSerialSession
 import it.nfcusb.linkopener.usb.usbDevice
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -39,14 +53,21 @@ import java.io.IOException
 
 data class ReaderSnapshot(
     val phase: ReaderPhase,
+    val operatorStatus: OperatorStatus,
     val devices: List<SerialDeviceChoice>,
     val settings: ReaderSettings,
     val log: List<LogEntry>,
-    val errorMessage: String?,
+    val technicalMessage: String?,
+    val lastReading: LastReading?,
+    val counters: SessionCounters,
+    val serviceRunning: Boolean,
 )
 
-class ReaderRuntime(private val app: Application) {
-    private val prefs = ReaderPreferences(app)
+class ReaderRuntime(
+    private val app: Application,
+    private val settingsRepository: SettingsRepository,
+    private val history: HistoryRepository,
+) {
     private val usbManager = app.getSystemService(UsbManager::class.java)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val connectMutex = Mutex()
@@ -56,44 +77,49 @@ class ReaderRuntime(private val app: Application) {
         onOverflow = ::onLineOverflow,
         onError = ::onSessionError,
     )
+    private val feedback = FeedbackPlayer(app)
 
     val notifier = ReaderNotifier(app)
     private val linkOpener = LinkOpener(app, notifier)
 
     private val phaseState = MutableStateFlow(ReaderPhase.NotConnected)
     private val devicesState = MutableStateFlow<List<SerialDeviceChoice>>(emptyList())
-    private val settingsState = MutableStateFlow(prefs.load())
+    private val settingsState = MutableStateFlow(ReaderSettings())
     private val logState = MutableStateFlow<List<LogEntry>>(emptyList())
-    private val errorState = MutableStateFlow<String?>(null)
+    private val technicalMessage = MutableStateFlow<String?>(null)
+    private val lastReading = MutableStateFlow<LastReading?>(null)
+    private val countersState = MutableStateFlow(SessionCounters())
+    private val serviceRunningState = MutableStateFlow(false)
 
-    val phase: StateFlow<ReaderPhase> = phaseState.asStateFlow()
-    val devices: StateFlow<List<SerialDeviceChoice>> = devicesState.asStateFlow()
-    val settings: StateFlow<ReaderSettings> = settingsState.asStateFlow()
-    val log: StateFlow<List<LogEntry>> = logState.asStateFlow()
-    val errorMessage: StateFlow<String?> = errorState.asStateFlow()
+    val phase: StateFlow<ReaderPhase> = phaseState
+    val settings: StateFlow<ReaderSettings> = settingsState
 
     val snapshot: StateFlow<ReaderSnapshot> = combine(
-        phaseState,
-        devicesState,
-        settingsState,
-        logState,
-        errorState,
-    ) { phase, devices, settings, log, error ->
-        ReaderSnapshot(phase, devices, settings, log, error)
-    }.stateIn(
-        scope,
-        kotlinx.coroutines.flow.SharingStarted.Eagerly,
+        combine(
+            phaseState,
+            devicesState,
+            settingsState,
+            logState,
+            technicalMessage,
+        ) { phase, devices, settings, log, message ->
+            CoreSlice(phase, devices, settings, log, message)
+        },
+        combine(lastReading, countersState, serviceRunningState) { reading, counters, running ->
+            TailSlice(reading, counters, running)
+        },
+    ) { core, tail ->
         ReaderSnapshot(
-            phaseState.value,
-            devicesState.value,
-            settingsState.value,
-            logState.value,
-            errorState.value,
-        ),
-    )
-
-    @Volatile
-    private var serviceRunning = false
+            phase = core.phase,
+            operatorStatus = operatorStatus(core.phase, tail.reading),
+            devices = core.devices,
+            settings = core.settings,
+            log = core.log,
+            technicalMessage = core.message,
+            lastReading = tail.reading,
+            counters = tail.counters,
+            serviceRunning = tail.running,
+        )
+    }.stateIn(scope, SharingStarted.Eagerly, emptySnapshot())
 
     @Volatile
     private var acceptPort = false
@@ -101,6 +127,9 @@ class ReaderRuntime(private val app: Application) {
     private var everActive = false
     private var pendingServiceStart = false
     private var suppressAutoPermission = false
+    private var attachGeneration = 0
+    private var attachRetryJob: Job? = null
+    private var successToken = 0
 
     private val permissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -109,8 +138,7 @@ class ReaderRuntime(private val app: Application) {
             if (!granted) {
                 suppressAutoPermission = true
                 phaseState.value = if (everActive) ReaderPhase.Unplugged else ReaderPhase.NotConnected
-                errorState.value = app.getString(R.string.log_permission_denied)
-                addLog(app.getString(R.string.log_permission_denied))
+                note(app.getString(R.string.log_permission_denied))
                 return
             }
             connectSelected(logIfMissing = false)
@@ -128,7 +156,7 @@ class ReaderRuntime(private val app: Application) {
                         session.close()
                         everActive = true
                         phaseState.value = ReaderPhase.Unplugged
-                        errorState.value = null
+                        technicalMessage.value = null
                         addLog(app.getString(R.string.log_detached))
                     }
                 }
@@ -138,6 +166,9 @@ class ReaderRuntime(private val app: Application) {
     }
 
     fun install() {
+        val loaded = runBlocking(Dispatchers.IO) { settingsRepository.load() }
+        settingsState.value = loaded
+        debouncer.windowMs = loaded.effectiveDebounce()
         notifier.ensureChannels()
         refreshDevices()
         ContextCompat.registerReceiver(
@@ -157,22 +188,33 @@ class ReaderRuntime(private val app: Application) {
         )
     }
 
-    fun statusLabel(phase: ReaderPhase = phaseState.value): String {
-        return when (phase) {
-            ReaderPhase.NotConnected -> app.getString(R.string.status_not_connected)
-            ReaderPhase.WaitingPermission -> app.getString(R.string.status_waiting)
-            ReaderPhase.Active -> app.getString(R.string.status_active)
-            ReaderPhase.Unplugged -> app.getString(R.string.status_unplugged)
+    fun operatorLabel(status: OperatorStatus = snapshot.value.operatorStatus): String {
+        return when (status) {
+            OperatorStatus.Ready -> app.getString(R.string.status_ready)
+            OperatorStatus.ConnectReader -> app.getString(R.string.status_connect)
+            OperatorStatus.WaitingTag -> app.getString(R.string.status_waiting_tag)
+            OperatorStatus.Disconnected -> app.getString(R.string.status_disconnected)
+            OperatorStatus.ReadError -> app.getString(R.string.status_read_error)
         }
     }
 
-    fun ongoingNotification() = notifier.ongoing(statusLabel())
+    fun technicalLabel(phase: ReaderPhase = phaseState.value): String {
+        return when (phase) {
+            ReaderPhase.NotConnected -> app.getString(R.string.tech_not_connected)
+            ReaderPhase.WaitingPermission -> app.getString(R.string.tech_waiting)
+            ReaderPhase.Active -> app.getString(R.string.tech_connected)
+            ReaderPhase.Unplugged -> app.getString(R.string.tech_unplugged)
+            ReaderPhase.ReadError -> app.getString(R.string.tech_read_error)
+        }
+    }
+
+    fun ongoingNotification() = notifier.ongoing(operatorLabel())
 
     fun onActivityStarted() {
         refreshDevices()
         if (!settingsState.value.armed) return
         if (phaseState.value == ReaderPhase.WaitingPermission) return
-        if (phaseState.value == ReaderPhase.Active && serviceRunning && session.isOpen) return
+        if (phaseState.value == ReaderPhase.Active && serviceRunningState.value && session.isOpen) return
         if (suppressAutoPermission && !pendingServiceStart) return
         if (devicesState.value.isEmpty()) {
             if (everActive || phaseState.value == ReaderPhase.Unplugged) {
@@ -184,22 +226,35 @@ class ReaderRuntime(private val app: Application) {
     }
 
     fun onUsbAttach() {
-        refreshDevices()
+        val generation = ++attachGeneration
+        attachRetryJob?.cancel()
         suppressAutoPermission = false
-        if (settingsState.value.armed) {
-            connectSelected(logIfMissing = false)
+        if (activateAttachedReader()) return
+        if (!settingsState.value.startOnAttach && !settingsState.value.armed) return
+        attachRetryJob = scope.launch {
+            repeat(ATTACH_RETRIES) {
+                delay(ATTACH_RETRY_MS)
+                if (generation != attachGeneration) return@launch
+                if (activateAttachedReader()) return@launch
+            }
         }
     }
 
     fun arm() {
+        attachGeneration++
+        attachRetryJob?.cancel()
+        resetSession()
+        phaseState.value = ReaderPhase.NotConnected
         updateSettings { it.copy(armed = true) }
         suppressAutoPermission = false
-        errorState.value = null
+        technicalMessage.value = null
         connectSelected(logIfMissing = true)
     }
 
     fun disarm() {
         val wasArmed = settingsState.value.armed
+        attachGeneration++
+        attachRetryJob?.cancel()
         acceptPort = false
         pendingServiceStart = false
         suppressAutoPermission = false
@@ -207,17 +262,22 @@ class ReaderRuntime(private val app: Application) {
         updateSettings { it.copy(armed = false) }
         session.close()
         phaseState.value = ReaderPhase.NotConnected
-        errorState.value = null
-        if (serviceRunning) {
-            serviceRunning = false
+        technicalMessage.value = null
+        if (serviceRunningState.value) {
+            serviceRunningState.value = false
             app.stopService(Intent(app, ReaderForegroundService::class.java))
         }
         if (wasArmed) addLog(app.getString(R.string.log_stopped))
     }
 
-    fun retry() {
+    fun reconnect() {
+        if (!settingsState.value.armed) {
+            arm()
+            return
+        }
         suppressAutoPermission = false
-        errorState.value = null
+        technicalMessage.value = null
+        session.close()
         connectSelected(logIfMissing = true)
     }
 
@@ -225,7 +285,7 @@ class ReaderRuntime(private val app: Application) {
         updateSettings { it.copy(selectedDeviceKey = key) }
         if (!settingsState.value.armed) return
         suppressAutoPermission = false
-        if (serviceRunning) {
+        if (serviceRunningState.value) {
             session.close()
             openSelectedPort()
         } else {
@@ -233,28 +293,65 @@ class ReaderRuntime(private val app: Application) {
         }
     }
 
-    fun updateBaud(baudRate: Int) {
-        updateSettings { it.copy(baudRate = baudRate) }
-    }
-
-    fun updateAutoOpen(enabled: Boolean) {
-        updateSettings { it.copy(autoOpen = enabled) }
-    }
-
-    fun updateDomains(text: String) {
-        updateSettings { it.copy(allowedDomainsText = text) }
+    fun updateSettings(block: (ReaderSettings) -> ReaderSettings) {
+        val updated = block(settingsState.value)
+        settingsState.value = updated
+        debouncer.windowMs = updated.effectiveDebounce()
+        scope.launch(Dispatchers.IO) { settingsRepository.save(updated) }
     }
 
     fun onNotificationsDenied() {
         addLog(app.getString(R.string.log_notifications_denied))
     }
 
-    fun simulate() {
-        SampleLines.sequence.forEach(::handleLine)
+    fun simulateValid() {
+        handleLine(SampleLines.VALID)
+    }
+
+    fun simulateDuplicate() {
+        handleLine(SampleLines.VALID)
+        handleLine(SampleLines.DUPLICATE)
+    }
+
+    fun simulateInvalid() {
+        handleLine(SampleLines.INVALID)
+    }
+
+    fun simulateUnauthorized() {
+        record(
+            code = "P04a",
+            url = SampleLines.UNAUTHORIZED.removePrefix(UrlLineParser.PREFIX),
+            outcome = VisualOutcome.Failure,
+            detail = app.getString(R.string.outcome_domain),
+            historyOutcome = ScanOutcome.Rejected,
+            countErrors = true,
+            countDuplicates = false,
+            countValid = false,
+            failureFeedback = true,
+        )
+    }
+
+    fun simulateDisconnect() {
+        session.close()
+        everActive = true
+        phaseState.value = ReaderPhase.Unplugged
+        technicalMessage.value = null
+        addLog(app.getString(R.string.log_simulated_disconnect))
+    }
+
+    fun reopen(url: String): Boolean {
+        val settings = settingsState.value
+        return when (val check = ReadingCheck.check(url, currentPolicy(), settings.codePattern)) {
+            is CheckResult.Accepted -> {
+                linkOpener.open(check.url, settings.internalBrowser)
+                true
+            }
+            is CheckResult.Rejected -> false
+        }
     }
 
     fun onServiceStarted() {
-        serviceRunning = true
+        serviceRunningState.value = true
         acceptPort = true
         pendingServiceStart = false
         openSelectedPort()
@@ -262,7 +359,7 @@ class ReaderRuntime(private val app: Application) {
 
     fun onServiceDestroyed() {
         acceptPort = false
-        serviceRunning = false
+        serviceRunningState.value = false
         session.close()
         if (settingsState.value.armed && phaseState.value == ReaderPhase.Active) {
             phaseState.value = ReaderPhase.Unplugged
@@ -272,11 +369,24 @@ class ReaderRuntime(private val app: Application) {
 
     fun onForegroundStartFailed() {
         acceptPort = false
-        serviceRunning = false
+        serviceRunningState.value = false
         pendingServiceStart = false
         phaseState.value = if (everActive) ReaderPhase.Unplugged else ReaderPhase.NotConnected
-        errorState.value = app.getString(R.string.log_fgs_failed)
-        addLog(app.getString(R.string.log_fgs_failed))
+        note(app.getString(R.string.log_fgs_failed))
+    }
+
+    private fun activateAttachedReader(): Boolean {
+        refreshDevices()
+        if (devicesState.value.isEmpty()) return false
+        if (!settingsState.value.armed) {
+            if (!settingsState.value.startOnAttach) return false
+            resetSession()
+            updateSettings { it.copy(armed = true) }
+            technicalMessage.value = null
+            addLog(app.getString(R.string.log_auto_started))
+        }
+        connectSelected(logIfMissing = false)
+        return true
     }
 
     private fun connectSelected(logIfMissing: Boolean) {
@@ -285,10 +395,7 @@ class ReaderRuntime(private val app: Application) {
         val choices = devicesState.value
         if (choices.isEmpty()) {
             phaseState.value = if (everActive) ReaderPhase.Unplugged else ReaderPhase.NotConnected
-            if (logIfMissing) {
-                errorState.value = app.getString(R.string.log_no_device)
-                addLog(app.getString(R.string.log_no_device))
-            }
+            if (logIfMissing) note(app.getString(R.string.log_no_device))
             return
         }
         if (selectedChoice() == null && choices.size == 1) {
@@ -297,7 +404,7 @@ class ReaderRuntime(private val app: Application) {
         val choice = selectedChoice()
         if (choice == null) {
             phaseState.value = if (everActive) ReaderPhase.Unplugged else ReaderPhase.NotConnected
-            errorState.value = app.getString(R.string.error_select_device)
+            technicalMessage.value = app.getString(R.string.error_select_device)
             return
         }
         val device = usbDevice(choice)
@@ -309,7 +416,7 @@ class ReaderRuntime(private val app: Application) {
             requestPermission(device)
             return
         }
-        if (serviceRunning) {
+        if (serviceRunningState.value) {
             openSelectedPort()
         } else {
             startReaderService()
@@ -324,18 +431,17 @@ class ReaderRuntime(private val app: Application) {
                 Intent(app, ReaderForegroundService::class.java),
             )
         } catch (_: Exception) {
-            errorState.value = app.getString(R.string.log_service_deferred)
-            addLog(app.getString(R.string.log_service_deferred))
+            note(app.getString(R.string.log_service_deferred))
         }
     }
 
     private fun openSelectedPort() {
         scope.launch {
             connectMutex.withLock {
-                if (!settingsState.value.armed || !serviceRunning) return@withLock
+                if (!settingsState.value.armed || !serviceRunningState.value) return@withLock
                 val choice = selectedChoice()
                 if (choice == null) {
-                    errorState.value = app.getString(R.string.error_select_device)
+                    technicalMessage.value = app.getString(R.string.error_select_device)
                     return@withLock
                 }
                 val device = usbDevice(choice)
@@ -352,7 +458,7 @@ class ReaderRuntime(private val app: Application) {
                 if (session.isOpen && session.openDeviceName == device.deviceName && session.baudRate == baud) {
                     phaseState.value = ReaderPhase.Active
                     everActive = true
-                    errorState.value = null
+                    technicalMessage.value = null
                     return@withLock
                 }
                 val opened = withContext(Dispatchers.IO) {
@@ -365,14 +471,13 @@ class ReaderRuntime(private val app: Application) {
                 opened.onSuccess {
                     phaseState.value = ReaderPhase.Active
                     everActive = true
-                    errorState.value = null
+                    technicalMessage.value = null
                     addLog(app.getString(R.string.log_port_open, baud))
                 }.onFailure {
                     session.close()
                     everActive = true
-                    phaseState.value = ReaderPhase.Unplugged
-                    errorState.value = app.getString(R.string.log_open_failed)
-                    addLog(app.getString(R.string.log_open_failed))
+                    phaseState.value = ReaderPhase.ReadError
+                    note(app.getString(R.string.log_open_failed))
                 }
             }
         }
@@ -380,8 +485,7 @@ class ReaderRuntime(private val app: Application) {
 
     private fun requestPermission(device: UsbDevice) {
         phaseState.value = ReaderPhase.WaitingPermission
-        errorState.value = null
-        // Il sistema scrive EXTRA_DEVICE e EXTRA_PERMISSION_GRANTED: il PendingIntent deve essere mutabile.
+        technicalMessage.value = null
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or pendingMutableFlag()
         val pending = PendingIntent.getBroadcast(
             app,
@@ -404,42 +508,154 @@ class ReaderRuntime(private val app: Application) {
         if (!settingsState.value.armed) return
         everActive = true
         session.close()
-        phaseState.value = ReaderPhase.Unplugged
-        errorState.value = app.getString(R.string.log_read_error)
-        addLog(app.getString(R.string.log_read_error))
+        phaseState.value = ReaderPhase.ReadError
+        countersState.value = countersState.value.copy(errors = countersState.value.errors + 1)
+        note(app.getString(R.string.log_read_error))
+        val current = settingsState.value
+        feedback.failure(current.vibrationEnabled, current.soundEnabled)
     }
 
     private fun handleLine(line: String) {
-        val domains = UrlLineParser.normalizeDomains(settingsState.value.allowedDomainsText)
-        when (val parsed = UrlLineParser.parse(line, domains)) {
-            ParsedLine.Ignored -> {
-                if (line.isNotBlank()) {
-                    addLog(app.getString(R.string.log_ignored, line.take(MAX_LOG_TEXT)))
-                }
-            }
-            is ParsedLine.Malformed -> {
-                val shown = parsed.rawUrl.ifBlank { "—" }.take(MAX_LOG_TEXT)
-                addLog(app.getString(R.string.log_invalid_url, shown))
-            }
-            is ParsedLine.RejectedDomain -> addLog(app.getString(R.string.log_domain, parsed.host))
-            is ParsedLine.Valid -> {
-                if (!settingsState.value.autoOpen) {
-                    addLog(app.getString(R.string.log_auto_off, parsed.url))
+        if (line.isNotBlank()) addLog(line.take(MAX_LOG_TEXT))
+        debouncer.windowMs = settingsState.value.effectiveDebounce()
+        when (val parsed = UrlLineParser.parse(line, currentPolicy())) {
+            ParsedLine.Ignored -> Unit
+            is ParsedLine.Malformed -> record(
+                code = "—",
+                url = parsed.rawUrl.ifBlank { "—" },
+                outcome = VisualOutcome.Failure,
+                detail = app.getString(R.string.outcome_invalid),
+                historyOutcome = ScanOutcome.Rejected,
+                countErrors = true,
+                countDuplicates = false,
+                countValid = false,
+                failureFeedback = true,
+            )
+            is ParsedLine.RejectedDomain -> record(
+                code = TagCodeExtractor.extract(parsed.url) ?: "—",
+                url = parsed.url,
+                outcome = VisualOutcome.Failure,
+                detail = app.getString(R.string.outcome_domain),
+                historyOutcome = ScanOutcome.Rejected,
+                countErrors = true,
+                countDuplicates = false,
+                countValid = false,
+                failureFeedback = true,
+            )
+            is ParsedLine.Valid -> onValidUrl(parsed.url)
+        }
+    }
+
+    private fun onValidUrl(url: String) {
+        val settings = settingsState.value
+        when (val check = ReadingCheck.check(url, currentPolicy(), settings.codePattern)) {
+            is CheckResult.Rejected -> record(
+                code = check.code ?: "—",
+                url = check.url,
+                outcome = VisualOutcome.Failure,
+                detail = when (check.kind) {
+                    CheckResult.Kind.Domain -> app.getString(R.string.outcome_domain)
+                    CheckResult.Kind.Code -> app.getString(R.string.outcome_code)
+                    CheckResult.Kind.Malformed -> app.getString(R.string.outcome_invalid)
+                },
+                historyOutcome = ScanOutcome.Rejected,
+                countErrors = true,
+                countDuplicates = false,
+                countValid = false,
+                failureFeedback = true,
+            )
+            is CheckResult.Accepted -> {
+                if (!settings.autoOpen) {
+                    record(
+                        code = check.code,
+                        url = check.url,
+                        outcome = VisualOutcome.Failure,
+                        detail = app.getString(R.string.outcome_auto_off),
+                        historyOutcome = ScanOutcome.Rejected,
+                        countErrors = true,
+                        countDuplicates = false,
+                        countValid = false,
+                        failureFeedback = true,
+                    )
                     return
                 }
-                if (!debouncer.shouldOpen(parsed.url)) {
-                    addLog(app.getString(R.string.log_duplicate, parsed.url))
+                if (!debouncer.shouldOpen(check.url)) {
+                    record(
+                        code = check.code,
+                        url = check.url,
+                        outcome = VisualOutcome.Duplicate,
+                        detail = app.getString(R.string.outcome_duplicate),
+                        historyOutcome = ScanOutcome.Duplicate,
+                        countErrors = false,
+                        countDuplicates = true,
+                        countValid = false,
+                        failureFeedback = false,
+                    )
                     return
                 }
-                val outcome = linkOpener.open(parsed.url)
-                val message = if (outcome == OpenOutcome.Opened) {
-                    app.getString(R.string.log_opened, parsed.url)
+                val opened = linkOpener.open(check.url, settings.internalBrowser)
+                val detail = if (opened == OpenOutcome.Opened) {
+                    app.getString(R.string.outcome_opened)
                 } else {
-                    app.getString(R.string.log_notified, parsed.url)
+                    app.getString(R.string.outcome_notified)
                 }
-                addLog(message)
+                record(
+                    code = check.code,
+                    url = check.url,
+                    outcome = VisualOutcome.Success,
+                    detail = detail,
+                    historyOutcome = ScanOutcome.Opened,
+                    countErrors = false,
+                    countDuplicates = false,
+                    countValid = true,
+                    failureFeedback = false,
+                )
             }
         }
+    }
+
+    private fun record(
+        code: String,
+        url: String,
+        outcome: VisualOutcome,
+        detail: String,
+        historyOutcome: ScanOutcome,
+        countErrors: Boolean,
+        countDuplicates: Boolean,
+        countValid: Boolean,
+        failureFeedback: Boolean,
+    ) {
+        val at = System.currentTimeMillis()
+        if (outcome == VisualOutcome.Success) successToken += 1
+        lastReading.value = LastReading(code, url, at, outcome, detail, successToken)
+        val counters = countersState.value
+        countersState.value = counters.copy(
+            valid = counters.valid + if (countValid) 1 else 0,
+            duplicates = counters.duplicates + if (countDuplicates) 1 else 0,
+            errors = counters.errors + if (countErrors) 1 else 0,
+        )
+        if (phaseState.value == ReaderPhase.ReadError && outcome == VisualOutcome.Success && session.isOpen) {
+            phaseState.value = ReaderPhase.Active
+        }
+        addLog(detail)
+        val current = settingsState.value
+        if (outcome == VisualOutcome.Success) {
+            feedback.success(current.vibrationEnabled, current.soundEnabled)
+        } else if (failureFeedback) {
+            feedback.failure(current.vibrationEnabled, current.soundEnabled)
+        }
+        scope.launch(Dispatchers.IO) {
+            history.insert(at, url, code, historyOutcome, detail)
+        }
+    }
+
+    private fun currentPolicy(): DomainPolicy {
+        val settings = settingsState.value
+        return DomainPolicy(
+            enabled = settings.whitelistEnabled,
+            domains = UrlLineParser.normalizeDomains(settings.allowedDomainsText),
+            openUnlisted = settings.openUnlisted,
+        )
     }
 
     private fun refreshDevices() {
@@ -461,23 +677,69 @@ class ReaderRuntime(private val app: Application) {
         return usbManager.deviceList.values.firstOrNull { it.deviceName == choice.deviceName }
     }
 
-    private fun updateSettings(block: (ReaderSettings) -> ReaderSettings) {
-        val updated = block(settingsState.value)
-        settingsState.value = updated
-        prefs.save(updated)
+    private fun resetSession() {
+        debouncer.clear()
+        countersState.value = SessionCounters()
+        lastReading.value = null
+        successToken = 0
+    }
+
+    private fun note(message: String) {
+        technicalMessage.value = message
+        addLog(message)
     }
 
     private fun addLog(message: String) {
-        val entry = LogEntry(System.currentTimeMillis(), message)
-        logState.value = (listOf(entry) + logState.value).take(MAX_LOG_LINES)
+        logState.value = (listOf(LogEntry(System.currentTimeMillis(), message)) + logState.value).take(MAX_LOG_LINES)
+    }
+
+    private fun operatorStatus(phase: ReaderPhase, reading: LastReading?): OperatorStatus {
+        return when (phase) {
+            ReaderPhase.ReadError -> OperatorStatus.ReadError
+            ReaderPhase.Unplugged -> OperatorStatus.Disconnected
+            ReaderPhase.Active -> if (reading == null) OperatorStatus.Ready else OperatorStatus.WaitingTag
+            ReaderPhase.NotConnected,
+            ReaderPhase.WaitingPermission,
+            -> OperatorStatus.ConnectReader
+        }
+    }
+
+    private fun emptySnapshot(): ReaderSnapshot {
+        return ReaderSnapshot(
+            phase = ReaderPhase.NotConnected,
+            operatorStatus = OperatorStatus.ConnectReader,
+            devices = emptyList(),
+            settings = ReaderSettings(),
+            log = emptyList(),
+            technicalMessage = null,
+            lastReading = null,
+            counters = SessionCounters(),
+            serviceRunning = false,
+        )
     }
 
     private fun pendingMutableFlag(): Int {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
     }
 
+    private data class CoreSlice(
+        val phase: ReaderPhase,
+        val devices: List<SerialDeviceChoice>,
+        val settings: ReaderSettings,
+        val log: List<LogEntry>,
+        val message: String?,
+    )
+
+    private data class TailSlice(
+        val reading: LastReading?,
+        val counters: SessionCounters,
+        val running: Boolean,
+    )
+
     companion object {
         const val ACTION_USB_PERMISSION = "it.nfcusb.linkopener.USB_PERMISSION"
+        private const val ATTACH_RETRIES = 5
+        private const val ATTACH_RETRY_MS = 300L
         private const val MAX_LOG_LINES = 50
         private const val MAX_LOG_TEXT = 180
     }
